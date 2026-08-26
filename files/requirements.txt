@@ -1,0 +1,3 @@
+feedparser>=6.0.10
+feedgen>=1.0.0
+requests>=2.31.0
