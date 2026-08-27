@@ -20,6 +20,13 @@ Config is via environment variables (all optional except GROQ_API_KEY):
     MAX_PICKS         Upper bound on articles selected. Default: 5
     MIN_PICKS         Lower bound on articles selected. Default: 1
     GROQ_MODEL        Model to use. Default: openai/gpt-oss-120b
+
+Full article summaries are stored, but a consistent length cap is applied
+before showing them to the model (to avoid biasing selection toward
+whichever source happens to write longer summaries), and batches are
+sized dynamically by estimated token count rather than a fixed article
+count, so this scales automatically whether you have 10 articles or
+10,000 — see BATCH_TOKEN_BUDGET and SUMMARY_DISPLAY_CHARS below.
 """
 
 import calendar
@@ -48,15 +55,38 @@ MIN_PICKS = int(os.environ.get("MIN_PICKS", "1"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 DEDUPE_THRESHOLD = float(os.environ.get("DEDUPE_THRESHOLD", "0.55"))
-MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "80"))
-SUMMARY_CHARS = int(os.environ.get("SUMMARY_CHARS", "60"))
-# If there are more distinct stories than MAX_CANDIDATES, they're split into
-# batches of MAX_CANDIDATES each. Each batch is asked to shortlist its most
-# promising stories, then one final call picks from the combined shortlist.
-PICKS_PER_BATCH = int(os.environ.get("PICKS_PER_BATCH", "8"))
-BATCH_SLEEP_SECONDS = float(os.environ.get("BATCH_SLEEP_SECONDS", "15"))
-# Keeps the prompt inside Groq's free-tier tokens-per-minute limit (8K for
-# gpt-oss-120b), with headroom for the model's reply and estimation error.
+
+# Full summaries are stored (no per-article truncation) other than this
+# safety net, which only guards against a pathological feed embedding an
+# entire multi-thousand-word article in its "summary" field.
+RAW_SUMMARY_CHARS_CAP = int(os.environ.get("RAW_SUMMARY_CHARS_CAP", "3000"))
+
+# What actually gets shown to the model, though, is capped to the SAME
+# length for every candidate. This matters: feeds vary a lot in how
+# verbose their summaries are, and that's a property of the feed's
+# writing style, not the story's importance. If one candidate showed up
+# with 3000 characters of summary and another with 40, the model would be
+# prone to "verbosity bias" -- rating the longer one as more substantive
+# just because there's more text, regardless of actual content. Capping
+# everyone to the same length removes that confound while still giving
+# far more context than a single short snippet would.
+SUMMARY_DISPLAY_CHARS = int(os.environ.get("SUMMARY_DISPLAY_CHARS", "350"))
+
+# Batches are packed by *estimated token count*, not a fixed article count,
+# so this scales automatically regardless of how long summaries are or how
+# many articles come in. BATCH_TOKEN_BUDGET leaves headroom under Groq's
+# free-tier 8,000-tokens-per-minute limit for openai/gpt-oss-120b (room for
+# the model's reply plus estimation slack). MAX_CANDIDATES_PER_BATCH is a
+# secondary cap so a batch of very short summaries doesn't end up with so
+# many candidates that the model's attention gets diluted.
+BATCH_TOKEN_BUDGET = int(os.environ.get("BATCH_TOKEN_BUDGET", "6000"))
+MAX_CANDIDATES_PER_BATCH = int(os.environ.get("MAX_CANDIDATES_PER_BATCH", "40"))
+CHARS_PER_TOKEN = 3.5  # conservative estimate, errs toward smaller batches
+
+# If there's more than one batch, each batch shortlists its most promising
+# stories, then one final call picks from the combined shortlist.
+PICKS_PER_BATCH = int(os.environ.get("PICKS_PER_BATCH", "4"))
+BATCH_SLEEP_SECONDS = float(os.environ.get("BATCH_SLEEP_SECONDS", "20"))
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -109,9 +139,9 @@ def fetch_recent_entries(feed_urls, hours):
             if pub is None or pub < cutoff:
                 continue
             entries.append({
-                "title": clean_html(e.get("title", "")).strip(),
+                "title": clean_html(e.get("title", "")).strip()[:300],
                 "link": e.get("link", ""),
-                "summary": clean_html(e.get("summary", e.get("description", "")))[:400],
+                "summary": clean_html(e.get("summary", e.get("description", "")))[:RAW_SUMMARY_CHARS_CAP],
                 "source": source_name,
                 "published": pub,
             })
@@ -162,19 +192,63 @@ def cluster_entries(entries, threshold):
 def rank_clusters(clusters):
     """Order candidates by how likely they are to matter: stories covered
     by more sources first (a decent proxy for significance), then most
-    recent. Used both to trim a single batch and to order batches
-    themselves so the most promising stories get first-batch priority."""
+    recent. Batches are filled in this order, so the most promising
+    stories always land in the earliest (and therefore never-dropped)
+    batches."""
     return sorted(clusters, key=lambda c: (c["count"], c["rep"]["published"]), reverse=True)
 
 
-def trim_candidates(clusters, max_candidates):
-    """Rank and cap to a single batch's worth of candidates."""
-    return rank_clusters(clusters)[:max_candidates]
+def estimate_tokens(text):
+    return len(text) / CHARS_PER_TOKEN
 
 
-def chunk_list(items, size):
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
+def format_candidate_line(idx, c):
+    rep = c["rep"]
+    return (
+        f"[{idx}] \"{rep['title']}\" "
+        f"(covered by {c['count']} source{'s' if c['count'] != 1 else ''}: "
+        f"{', '.join(sorted(c['sources']))[:120]})\n"
+        f"    {rep['summary'][:SUMMARY_DISPLAY_CHARS]}"
+    )
+
+
+BOILERPLATE_TOKEN_ESTIMATE = 220  # rough size of the instructions text
+
+
+def build_batches(ranked_clusters, token_budget, max_per_batch):
+    """Pack candidates into batches sized by estimated token count (not a
+    fixed article count), so this scales automatically whether summaries
+    are short or full-length, and whether there are 10 articles or 10,000."""
+    batches = []
+    current = []
+    current_tokens = BOILERPLATE_TOKEN_ESTIMATE
+
+    for c in ranked_clusters:
+        line = format_candidate_line(len(current), c)
+        line_tokens = estimate_tokens(line)
+
+        # Safety valve: clip a single pathologically long summary rather
+        # than letting it blow the whole batch's budget on its own.
+        room = token_budget - BOILERPLATE_TOKEN_ESTIMATE
+        if line_tokens > room:
+            max_chars = max(int(room * CHARS_PER_TOKEN) - 200, 0)
+            c = {**c, "rep": {**c["rep"], "summary": c["rep"]["summary"][:max_chars]}}
+            line = format_candidate_line(len(current), c)
+            line_tokens = estimate_tokens(line)
+
+        would_exceed_tokens = current and (current_tokens + line_tokens > token_budget)
+        would_exceed_count = len(current) >= max_per_batch
+        if would_exceed_tokens or would_exceed_count:
+            batches.append(current)
+            current = []
+            current_tokens = BOILERPLATE_TOKEN_ESTIMATE
+
+        current.append(c)
+        current_tokens += line_tokens
+
+    if current:
+        batches.append(current)
+    return batches
 
 
 def build_prompt(clusters, max_picks, min_picks, include_reason=True):
@@ -183,6 +257,8 @@ def build_prompt(clusters, max_picks, min_picks, include_reason=True):
         "from a pool of candidates gathered over the last 24 hours. Duplicate "
         "coverage of the same story has already been merged; the source count "
         "below tells you how many outlets covered it.",
+        "",
+        "Summaries are trimmed to a consistent length for every candidate. ",
         "",
         f"Select between {min_picks} and {max_picks} articles. Prioritize "
         "highly signficant articles, ones that would actually change/refine the reader's understanding of the world and global events. Cater to a California audience but keep them updated on relevant global news."
@@ -193,13 +269,7 @@ def build_prompt(clusters, max_picks, min_picks, include_reason=True):
         "Candidates:",
     ]
     for i, c in enumerate(clusters):
-        rep = c["rep"]
-        lines.append(
-            f"[{i}] \"{rep['title']}\" "
-            f"(covered by {c['count']} source{'s' if c['count'] != 1 else ''}: "
-            f"{', '.join(sorted(c['sources']))[:120]})\n"
-            f"    {rep['summary'][:SUMMARY_CHARS]}"
-        )
+        lines.append(format_candidate_line(i, c))
     lines.append("")
     if include_reason:
         lines.append(
@@ -260,17 +330,18 @@ def select_best(clusters):
     if not clusters:
         return []
 
-    if len(clusters) <= MAX_CANDIDATES:
-        clusters = trim_candidates(clusters, MAX_CANDIDATES)
-        prompt = build_prompt(clusters, MAX_PICKS, MIN_PICKS)
-        data = call_groq(prompt)
-        return apply_picks(clusters, data, MAX_PICKS)
-
-    # Too many distinct stories for one call: shortlist each batch, then
-    # make a final pick across the combined shortlist.
     ranked = rank_clusters(clusters)
-    batches = list(chunk_list(ranked, MAX_CANDIDATES))
-    print(f"  {len(clusters)} distinct stories -> splitting into {len(batches)} batches")
+    batches = build_batches(ranked, BATCH_TOKEN_BUDGET, MAX_CANDIDATES_PER_BATCH)
+
+    if len(batches) == 1:
+        prompt = build_prompt(batches[0], MAX_PICKS, MIN_PICKS)
+        data = call_groq(prompt)
+        return apply_picks(batches[0], data, MAX_PICKS)
+
+    # Too many/too long candidates for one call: shortlist each batch, then
+    # make a final pick across the combined shortlist.
+    print(f"  {len(clusters)} distinct stories -> {len(batches)} batches "
+          f"(sizes: {[len(b) for b in batches]})")
 
     shortlist = []
     for i, batch in enumerate(batches):
@@ -288,10 +359,22 @@ def select_best(clusters):
     if not shortlist:
         return []
 
+    # The shortlist itself might still be too big/long for one call
+    # (e.g. many batches each contributing 8 picks with full summaries),
+    # so run it through the same batching logic rather than assuming.
+    shortlist_ranked = rank_clusters(shortlist)
+    final_batches = build_batches(shortlist_ranked, BATCH_TOKEN_BUDGET, MAX_CANDIDATES_PER_BATCH)
+    if len(final_batches) > 1:
+        # Rare, but if it happens, just take the top slice by rank rather
+        # than recursing into another full shortlist round.
+        final_candidates = shortlist_ranked[: max(len(b) for b in final_batches)]
+    else:
+        final_candidates = final_batches[0]
+
     time.sleep(BATCH_SLEEP_SECONDS)
-    final_prompt = build_prompt(shortlist, MAX_PICKS, MIN_PICKS)
+    final_prompt = build_prompt(final_candidates, MAX_PICKS, MIN_PICKS)
     data = call_groq(final_prompt)
-    return apply_picks(shortlist, data, MAX_PICKS)
+    return apply_picks(final_candidates, data, MAX_PICKS)
 
 
 # ---- step 5: write the output feed --------------------------------------
