@@ -19,7 +19,7 @@ Config is via environment variables (all optional except GROQ_API_KEY):
     LOOKBACK_HOURS    How far back to consider articles. Default: 24
     MAX_PICKS         Upper bound on articles selected. Default: 5
     MIN_PICKS         Lower bound on articles selected. Default: 1
-    GROQ_MODEL        Model to use. Default: llama-3.3-70b-versatile
+    GROQ_MODEL        Model to use. Default: openai/gpt-oss-120b
 """
 
 import calendar
@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
@@ -44,9 +45,18 @@ OUTPUT_FEED_LINK = os.environ.get(
 LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
 MAX_PICKS = int(os.environ.get("MAX_PICKS", "5"))
 MIN_PICKS = int(os.environ.get("MIN_PICKS", "1"))
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 DEDUPE_THRESHOLD = float(os.environ.get("DEDUPE_THRESHOLD", "0.55"))
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "80"))
+SUMMARY_CHARS = int(os.environ.get("SUMMARY_CHARS", "60"))
+# If there are more distinct stories than MAX_CANDIDATES, they're split into
+# batches of MAX_CANDIDATES each. Each batch is asked to shortlist its most
+# promising stories, then one final call picks from the combined shortlist.
+PICKS_PER_BATCH = int(os.environ.get("PICKS_PER_BATCH", "8"))
+BATCH_SLEEP_SECONDS = float(os.environ.get("BATCH_SLEEP_SECONDS", "15"))
+# Keeps the prompt inside Groq's free-tier tokens-per-minute limit (8K for
+# gpt-oss-120b), with headroom for the model's reply and estimation error.
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -101,7 +111,7 @@ def fetch_recent_entries(feed_urls, hours):
             entries.append({
                 "title": clean_html(e.get("title", "")).strip(),
                 "link": e.get("link", ""),
-                "summary": clean_html(e.get("summary", e.get("description", "")))[:600],
+                "summary": clean_html(e.get("summary", e.get("description", "")))[:400],
                 "source": source_name,
                 "published": pub,
             })
@@ -149,17 +159,36 @@ def cluster_entries(entries, threshold):
 
 # ---- step 4: ask Groq to pick the best ----------------------------------
 
-def build_prompt(clusters):
+def rank_clusters(clusters):
+    """Order candidates by how likely they are to matter: stories covered
+    by more sources first (a decent proxy for significance), then most
+    recent. Used both to trim a single batch and to order batches
+    themselves so the most promising stories get first-batch priority."""
+    return sorted(clusters, key=lambda c: (c["count"], c["rep"]["published"]), reverse=True)
+
+
+def trim_candidates(clusters, max_candidates):
+    """Rank and cap to a single batch's worth of candidates."""
+    return rank_clusters(clusters)[:max_candidates]
+
+
+def chunk_list(items, size):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def build_prompt(clusters, max_picks, min_picks, include_reason=True):
     lines = [
         "You are a discerning news editor picking today's must-read articles "
         "from a pool of candidates gathered over the last 24 hours. Duplicate "
         "coverage of the same story has already been merged; the source count "
         "below tells you how many outlets covered it.",
         "",
-        f"Select between {MIN_PICKS} and {MAX_PICKS} articles. Prioritize genuine "
-        "significance and novelty over sensationalism, and prefer a diverse set "
-        "of topics over several similar stories. It's fine to select fewer than "
-        f"{MAX_PICKS} if the pool is thin.",
+        f"Select between {min_picks} and {max_picks} articles. Prioritize "
+        "highly signficant articles, ones that would actually change/refine the reader's understanding of the world and global events. Cater to a California audience but keep them updated on relevant global news."
+        "Give a moderate bias towards articles about education, and a slight bias to articles that concern the US. If the article is a political one, it must be something every American should know about. Avoid sensationalism."
+        "It's fine to select fewer than "
+        f"{max_picks} if the pool is thin.",
         "",
         "Candidates:",
     ]
@@ -169,14 +198,20 @@ def build_prompt(clusters):
             f"[{i}] \"{rep['title']}\" "
             f"(covered by {c['count']} source{'s' if c['count'] != 1 else ''}: "
             f"{', '.join(sorted(c['sources']))[:120]})\n"
-            f"    {rep['summary'][:300]}"
+            f"    {rep['summary'][:SUMMARY_CHARS]}"
         )
     lines.append("")
-    lines.append(
-        "Respond with ONLY a JSON object of the form "
-        '{"picks": [{"index": <int>, "reason": "<one sentence>"}]} '
-        "and nothing else."
-    )
+    if include_reason:
+        lines.append(
+            "Respond with ONLY a JSON object of the form "
+            '{"picks": [{"index": <int>, "reason": "<one sentence>"}]} '
+            "and nothing else."
+        )
+    else:
+        lines.append(
+            "Respond with ONLY a JSON object of the form "
+            '{"picks": [{"index": <int>}]} and nothing else.'
+        )
     return "\n".join(lines)
 
 
@@ -209,12 +244,8 @@ def parse_llm_json(content):
         raise
 
 
-def select_best(clusters):
-    if not clusters:
-        return []
-    prompt = build_prompt(clusters)
-    data = call_groq(prompt)
-    picks = data.get("picks", [])[:MAX_PICKS]
+def apply_picks(clusters, data, max_picks):
+    picks = data.get("picks", [])[:max_picks]
     selected = []
     for p in picks:
         idx = p.get("index")
@@ -223,6 +254,44 @@ def select_best(clusters):
         c = clusters[idx]
         selected.append({**c["rep"], "reason": p.get("reason", ""), "source_count": c["count"]})
     return selected
+
+
+def select_best(clusters):
+    if not clusters:
+        return []
+
+    if len(clusters) <= MAX_CANDIDATES:
+        clusters = trim_candidates(clusters, MAX_CANDIDATES)
+        prompt = build_prompt(clusters, MAX_PICKS, MIN_PICKS)
+        data = call_groq(prompt)
+        return apply_picks(clusters, data, MAX_PICKS)
+
+    # Too many distinct stories for one call: shortlist each batch, then
+    # make a final pick across the combined shortlist.
+    ranked = rank_clusters(clusters)
+    batches = list(chunk_list(ranked, MAX_CANDIDATES))
+    print(f"  {len(clusters)} distinct stories -> splitting into {len(batches)} batches")
+
+    shortlist = []
+    for i, batch in enumerate(batches):
+        prompt = build_prompt(batch, PICKS_PER_BATCH, 1, include_reason=False)
+        data = call_groq(prompt)
+        picks = data.get("picks", [])[:PICKS_PER_BATCH]
+        for p in picks:
+            idx = p.get("index")
+            if idx is not None and 0 <= idx < len(batch):
+                shortlist.append(batch[idx])
+        print(f"  batch {i + 1}/{len(batches)}: shortlisted {len(picks)}")
+        if i < len(batches) - 1:
+            time.sleep(BATCH_SLEEP_SECONDS)  # stay under the per-minute token limit
+
+    if not shortlist:
+        return []
+
+    time.sleep(BATCH_SLEEP_SECONDS)
+    final_prompt = build_prompt(shortlist, MAX_PICKS, MIN_PICKS)
+    data = call_groq(final_prompt)
+    return apply_picks(shortlist, data, MAX_PICKS)
 
 
 # ---- step 5: write the output feed --------------------------------------

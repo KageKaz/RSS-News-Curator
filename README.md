@@ -46,7 +46,12 @@ All of these are environment variables you can set in the workflow file:
 - `LOOKBACK_HOURS` — the time window (default 24)
 - `DEDUPE_THRESHOLD` — how aggressively similar titles get merged as the
   same story (0–1, default 0.55; higher = stricter matching, fewer merges)
-- `GROQ_MODEL` — swap models if you want (default `llama-3.3-70b-versatile`)
+- `GROQ_MODEL` — swap models if you want (default `openai/gpt-oss-120b`; check
+  https://console.groq.com/docs/models for the current list if you get a
+  `model_not_found` / 404 error, since Groq periodically deprecates models)
+- `MAX_CANDIDATES` — upper bound on how many deduped stories get sent to the
+  model in one request (default 40, prioritizing stories covered by more
+  sources). If you ever see a `413 Payload Too Large` error, lower this.
 
 ## Local testing
 
