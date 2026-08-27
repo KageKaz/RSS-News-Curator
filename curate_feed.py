@@ -47,7 +47,7 @@ from feedgen.feed import FeedGenerator
 FEEDS_FILE = os.environ.get("FEEDS_FILE", "feeds.txt")
 OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "docs/feed.xml")
 OUTPUT_FEED_LINK = os.environ.get(
-    "OUTPUT_FEED_LINK", "https://example.github.io/rss-curator/feed.xml"
+    "OUTPUT_FEED_LINK", "https://kagekaz.github.io/RSS-News-Curator/feed.xml"
 )
 LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "24"))
 MAX_PICKS = int(os.environ.get("MAX_PICKS", "5"))
@@ -388,7 +388,6 @@ def select_best(clusters):
 def generate_feed(selected, output_path):
     fg = FeedGenerator()
     fg.title("Daily curated picks")
-    fg.link(href=OUTPUT_FEED_LINK, rel="alternate")
     fg.link(href=OUTPUT_FEED_LINK, rel="self")
     fg.description("Automatically curated best articles from the last 24 hours")
     fg.language("en")
