@@ -1,9 +1,9 @@
 # One RSS feed URL per line. Lines starting with # are ignored.
 # Replace these with your own 10 feeds.
-https://feeds.bbci.co.uk/news/world/rss.xml
 https://feeds.proquest.com/rss/2219439
 https://feeds.proquest.com/rss/2219459
 http://www.insidehighered.com/rss/feed/ihe
 http://feeds.feedburner.com/TheAtlantic
 https://www.bloomberg.com/feeds/news.rss
 https://feeds.proquest.com/rss/2219479
+https://news.google.com/rss/search?q=site%3Areuters.com&hl=en-US&gl=US&ceid=US%3Aen
