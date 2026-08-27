@@ -388,6 +388,7 @@ def select_best(clusters):
 def generate_feed(selected, output_path):
     fg = FeedGenerator()
     fg.title("Daily curated picks")
+    fg.link(href=OUTPUT_FEED_LINK, rel="alternate")
     fg.link(href=OUTPUT_FEED_LINK, rel="self")
     fg.description("Automatically curated best articles from the last 24 hours")
     fg.language("en")
