@@ -7,4 +7,3 @@ http://www.insidehighered.com/rss/feed/ihe
 http://feeds.feedburner.com/TheAtlantic
 https://www.bloomberg.com/feeds/news.rss
 https://feeds.proquest.com/rss/2219479
-https://news.google.com/rss/search?q=site%3Areuters.com&hl=en-US&gl=US&ceid=US%3Aen
