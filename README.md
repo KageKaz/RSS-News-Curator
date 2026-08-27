@@ -102,7 +102,7 @@ Tuning knobs:
   doesn't affect normal RSS summaries, which are almost always well
   under it.
 - `PICKS_PER_BATCH` — how many stories each batch shortlists (default 8)
-- `BATCH_SLEEP_SECONDS` — pause between calls (default 15s)
+- `BATCH_SLEEP_SECONDS` — pause between calls (default 60s)
 
 Note: with a wide/diverse candidate pool, `DEDUPE_THRESHOLD` may need
 tuning too — headlines that share a lot of common phrasing (e.g. "X hits

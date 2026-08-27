@@ -54,7 +54,7 @@ MAX_PICKS = int(os.environ.get("MAX_PICKS", "5"))
 MIN_PICKS = int(os.environ.get("MIN_PICKS", "1"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-DEDUPE_THRESHOLD = float(os.environ.get("DEDUPE_THRESHOLD", "0.55"))
+DEDUPE_THRESHOLD = float(os.environ.get("DEDUPE_THRESHOLD", "0.5"))
 
 # Full summaries are stored (no per-article truncation) other than this
 # safety net, which only guards against a pathological feed embedding an
@@ -70,7 +70,7 @@ RAW_SUMMARY_CHARS_CAP = int(os.environ.get("RAW_SUMMARY_CHARS_CAP", "3000"))
 # just because there's more text, regardless of actual content. Capping
 # everyone to the same length removes that confound while still giving
 # far more context than a single short snippet would.
-SUMMARY_DISPLAY_CHARS = int(os.environ.get("SUMMARY_DISPLAY_CHARS", "350"))
+SUMMARY_DISPLAY_CHARS = int(os.environ.get("SUMMARY_DISPLAY_CHARS", "180"))
 
 # Batches are packed by *estimated token count*, not a fixed article count,
 # so this scales automatically regardless of how long summaries are or how
@@ -80,13 +80,13 @@ SUMMARY_DISPLAY_CHARS = int(os.environ.get("SUMMARY_DISPLAY_CHARS", "350"))
 # secondary cap so a batch of very short summaries doesn't end up with so
 # many candidates that the model's attention gets diluted.
 BATCH_TOKEN_BUDGET = int(os.environ.get("BATCH_TOKEN_BUDGET", "6000"))
-MAX_CANDIDATES_PER_BATCH = int(os.environ.get("MAX_CANDIDATES_PER_BATCH", "40"))
+MAX_CANDIDATES_PER_BATCH = int(os.environ.get("MAX_CANDIDATES_PER_BATCH", "50"))
 CHARS_PER_TOKEN = 3.5  # conservative estimate, errs toward smaller batches
 
 # If there's more than one batch, each batch shortlists its most promising
 # stories, then one final call picks from the combined shortlist.
 PICKS_PER_BATCH = int(os.environ.get("PICKS_PER_BATCH", "4"))
-BATCH_SLEEP_SECONDS = float(os.environ.get("BATCH_SLEEP_SECONDS", "20"))
+BATCH_SLEEP_SECONDS = float(os.environ.get("BATCH_SLEEP_SECONDS", "60"))
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -258,7 +258,7 @@ def build_prompt(clusters, max_picks, min_picks, include_reason=True):
         "coverage of the same story has already been merged; the source count "
         "below tells you how many outlets covered it.",
         "",
-        "Summaries are trimmed to a consistent length for every candidate. ",
+        "Summaries are trimmed to a consistent length for every candidate, the first 180 characters. ",
         "",
         f"Select between {min_picks} and {max_picks} articles. Prioritize "
         "highly signficant articles, ones that would actually change/refine the reader's understanding of the world and global events. Cater to a California audience but keep them updated on relevant global news."
@@ -285,23 +285,29 @@ def build_prompt(clusters, max_picks, min_picks, include_reason=True):
     return "\n".join(lines)
 
 
-def call_groq(prompt):
+def call_groq(prompt, max_retries=3):
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set")
-    resp = requests.post(
-        GROQ_ENDPOINT,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={
-            "model": GROQ_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
-    return parse_llm_json(content)
+    for attempt in range(max_retries + 1):
+        resp = requests.post(
+            GROQ_ENDPOINT,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=60,
+        )
+        if resp.status_code == 429 and attempt < max_retries:
+            wait = float(resp.headers.get("retry-after", 2 ** attempt * 10))
+            print(f"  ! rate limited, waiting {wait:.0f}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        return parse_llm_json(content)
 
 
 def parse_llm_json(content):
