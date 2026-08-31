@@ -3,8 +3,6 @@
 https://feeds.proquest.com/rss/2219439
 https://feeds.proquest.com/rss/2219459
 http://www.insidehighered.com/rss/feed/ihe
-http://feeds.feedburner.com/TheAtlantic
-https://www.bloomberg.com/feeds/news.rss
 https://feeds.proquest.com/rss/2219479
 https://news.google.com/rss/search?q=site%3Areuters.com&hl=en-US&gl=US&ceid=US%3Aen
 https://www.hrw.org/rss/news
@@ -14,3 +12,4 @@ https://www.chalkbeat.org/arc/outboundfeeds/rss/
 https://relevantmagazine.com/feed/
 https://www.christiancentury.org/rss.xml
 https://www.christianitytoday.com/feed/
+https://www.the74million.org/feed/

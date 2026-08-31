@@ -262,7 +262,9 @@ def build_prompt(clusters, max_picks, min_picks, include_reason=True):
         "",
         f"Select between {min_picks} and {max_picks} articles. Prioritize "
         "highly signficant articles, ones that would actually change/refine the reader's understanding of the world and global events. Cater to a California audience but keep them updated on relevant global news."
-        "Give a moderate positive bias towards articles about education, and a slight positive bias towards articles that concern the US. If the article is a political one, it must be something every American should know about. Avoid sensationalism."
+        "Give a moderate positive bias towards articles about education, and a slight positive bias towards articles that concern the US."
+        "Give a slight positive bias towards article of intrest to Christians. Give a slight positive bias towards articles that are relevant to philosophy."
+        "If the article is a political one, but it must be something every American should know about. Avoid sensationalism."
         "It's fine to select fewer than "
         f"{max_picks} if the pool is thin.",
         "",

@@ -1,10 +1,7 @@
 name: Daily RSS curation
 
 on:
-  schedule:
-    # 16:00 UTC every day — adjust to whenever you want your digest ready.
-    - cron: "0 16 * * *"
-  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+  workflow_dispatch: {}   # triggered externally by cron-job.org
 
 permissions:
   contents: write
